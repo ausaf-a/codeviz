@@ -78,6 +78,9 @@ async function init() {
     // Check WebXR support and add VR button
     await setupVR();
 
+    // Setup player rig for VR locomotion
+    setupPlayerRig();
+
     // Raycaster for interaction
     raycaster = new THREE.Raycaster();
 
@@ -162,16 +165,6 @@ function setupControllers() {
 
     controller1.add(new THREE.Line(lineGeometry.clone(), lineMaterial));
     controller2.add(new THREE.Line(lineGeometry.clone(), lineMaterial));
-
-    // Listen for session start/end
-    renderer.xr.addEventListener('sessionstart', () => {
-        log('VR session started');
-        showVRStatus('In VR');
-    });
-    renderer.xr.addEventListener('sessionend', () => {
-        log('VR session ended');
-        showVRStatus('VR Ready');
-    });
 }
 
 async function loadScene() {
@@ -288,77 +281,101 @@ function onSelectStart(event) {
 function onSelectEnd(event) {
     const controller = event.target;
     controller.userData.isSelecting = false;
-
-    // Teleport on select end
-    if (renderer.xr.isPresenting) {
-        teleportOnRaycast(controller);
-    }
 }
 
-function teleportOnRaycast(controller) {
-    const tempMatrix = new THREE.Matrix4();
-    tempMatrix.identity().extractRotation(controller.matrixWorld);
+// VR locomotion settings
+const VR_MOVE_SPEED = 0.05;
+const VR_TURN_SPEED = 0.025;
+const DEADZONE = 0.15;
 
-    raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
-    raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+// Player rig for VR movement
+let playerRig;
+let vrActive = false;
 
-    const intersects = raycaster.intersectObjects(scene.children, true);
+function setupPlayerRig() {
+    // Create a rig that holds the camera - we move/rotate this instead of the reference space
+    playerRig = new THREE.Group();
+    playerRig.position.set(spawnPoint.x, 0, spawnPoint.z);
+    scene.add(playerRig);
 
-    for (const intersect of intersects) {
-        // Check if we hit a floor/ground
-        if (intersect.face && intersect.face.normal.y > 0.8) {
-            const baseReferenceSpace = renderer.xr.getReferenceSpace();
-            const offsetPosition = {
-                x: -intersect.point.x,
-                y: -intersect.point.y,
-                z: -intersect.point.z,
-                w: 1
-            };
-            const offsetRotation = new THREE.Quaternion();
-            const transform = new XRRigidTransform(offsetPosition, offsetRotation);
-            const teleportReferenceSpace = baseReferenceSpace.getOffsetReferenceSpace(transform);
-            renderer.xr.setReferenceSpace(teleportReferenceSpace);
-            break;
-        }
-    }
+    // Listen for VR session
+    renderer.xr.addEventListener('sessionstart', () => {
+        vrActive = true;
+        // Add camera to rig when entering VR
+        playerRig.add(camera);
+        camera.position.set(0, 0, 0);
+        log('VR session started, player rig active');
+    });
+
+    renderer.xr.addEventListener('sessionend', () => {
+        vrActive = false;
+        // Remove camera from rig when exiting VR
+        scene.add(camera);
+        camera.position.set(spawnPoint.x, spawnPoint.y, spawnPoint.z);
+        log('VR session ended');
+    });
 }
 
 function handleVRMovement() {
     const session = renderer.xr.getSession();
-    if (!session) return;
+    if (!session || !playerRig) return;
+
+    let moveX = 0, moveZ = 0, moveY = 0;
+    let turnY = 0;
 
     for (const source of session.inputSources) {
-        if (source.gamepad && source.handedness === 'left') {
-            const axes = source.gamepad.axes;
-            // Thumbstick movement
-            if (Math.abs(axes[2]) > 0.1 || Math.abs(axes[3]) > 0.1) {
-                const xrCamera = renderer.xr.getCamera();
-                const direction = new THREE.Vector3();
-                xrCamera.getWorldDirection(direction);
-                direction.y = 0;
-                direction.normalize();
+        if (!source.gamepad) continue;
 
-                const right = new THREE.Vector3();
-                right.crossVectors(direction, new THREE.Vector3(0, 1, 0));
+        const axes = source.gamepad.axes;
+        const stickX = axes[2] || 0;
+        const stickY = axes[3] || 0;
 
-                const movement = new THREE.Vector3();
-                movement.addScaledVector(direction, -axes[3] * 0.05);
-                movement.addScaledVector(right, axes[2] * 0.05);
-
-                // Move the XR reference space
-                const baseReferenceSpace = renderer.xr.getReferenceSpace();
-                const offsetPosition = {
-                    x: movement.x,
-                    y: 0,
-                    z: movement.z,
-                    w: 1
-                };
-                const offsetRotation = new THREE.Quaternion();
-                const transform = new XRRigidTransform(offsetPosition, offsetRotation);
-                const newReferenceSpace = baseReferenceSpace.getOffsetReferenceSpace(transform);
-                renderer.xr.setReferenceSpace(newReferenceSpace);
+        if (source.handedness === 'left') {
+            // Left stick: horizontal movement
+            if (Math.abs(stickX) > DEADZONE) {
+                moveX = stickX * VR_MOVE_SPEED;
+            }
+            if (Math.abs(stickY) > DEADZONE) {
+                moveZ = stickY * VR_MOVE_SPEED;
+            }
+        } else if (source.handedness === 'right') {
+            // Right stick X: turn
+            if (Math.abs(stickX) > DEADZONE) {
+                turnY = stickX * VR_TURN_SPEED;
+            }
+            // Right stick Y: fly up/down
+            if (Math.abs(stickY) > DEADZONE) {
+                moveY = -stickY * VR_MOVE_SPEED;
             }
         }
+    }
+
+    // Apply rotation to player rig
+    if (Math.abs(turnY) > 0.001) {
+        playerRig.rotation.y -= turnY;
+    }
+
+    // Apply vertical movement (flying)
+    if (Math.abs(moveY) > 0.001) {
+        playerRig.position.y += moveY;
+    }
+
+    // Apply horizontal movement relative to player rig's facing direction
+    if (Math.abs(moveX) > 0.001 || Math.abs(moveZ) > 0.001) {
+        // Get forward direction based on rig rotation
+        const forward = new THREE.Vector3(0, 0, -1);
+        forward.applyQuaternion(playerRig.quaternion);
+        forward.y = 0;
+        forward.normalize();
+
+        const right = new THREE.Vector3(1, 0, 0);
+        right.applyQuaternion(playerRig.quaternion);
+        right.y = 0;
+        right.normalize();
+
+        // Move rig
+        playerRig.position.addScaledVector(forward, -moveZ);
+        playerRig.position.addScaledVector(right, moveX);
     }
 }
 
